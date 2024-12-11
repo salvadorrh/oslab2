@@ -1,5 +1,3 @@
-Basic Networked FUSE Filesystem
-
 #!/usr/bin/env python3
 
 import os
