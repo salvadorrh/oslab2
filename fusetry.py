@@ -45,7 +45,29 @@ class NetworkedFS(Operations):
         
         self._verify_remote_setup()
 
-    # [Previous methods remain the same...]
+    def _fetch_file(self, path):
+        """Fetch file from remote server to cache"""
+        remote_path = self._get_remote_path(path)
+        cache_path = os.path.join(self.cache_dir, path.lstrip('/'))
+        
+        # Create cache directory structure if needed
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        
+        try:
+            cmd = [
+                'scp',
+                '-P', str(self.ssh_port),
+                '-i', self.identity_file,
+                f'{self.remote_host}:{remote_path}',
+                cache_path
+            ]
+            logger.debug(f"Fetching file: {' '.join(cmd)}")
+            subprocess.run(cmd, check=True)
+            logger.info(f"Successfully fetched '{path}' to cache")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to fetch '{path}': {e}")
+            return False
 
     def create(self, path, mode, fi=None):
         """Create a new file"""
