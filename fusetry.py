@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 import logging
 import time
+import pwd
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -19,21 +20,29 @@ class NetworkedFS(Operations):
         self.remote_path = os.path.abspath(remote_path)
         self.ssh_port = ssh_port
         self.cache_dir = '/tmp/netfs_cache'
+        
+        # Get the original user's home directory and SSH key
+        sudo_user = os.environ.get('SUDO_USER', os.environ.get('USER'))
+        user_info = pwd.getpwnam(sudo_user)
+        self.user_home = user_info.pw_dir
+        self.identity_file = os.path.join(self.user_home, '.ssh/id_rsa')
+        
         Path(self.cache_dir).mkdir(exist_ok=True)
         logger.info(f"Initialized NetworkedFS with:")
         logger.info(f"  Remote Host: {remote_host}")
         logger.info(f"  Remote Path: {self.remote_path}")
         logger.info(f"  SSH Port: {ssh_port}")
         logger.info(f"  Cache Dir: {self.cache_dir}")
+        logger.info(f"  Using identity file: {self.identity_file}")
         
-        # Verify remote connection and directory
         self._verify_remote_setup()
 
     def _run_ssh_command(self, command):
-        """Run a command over SSH with proper quoting"""
+        """Run a command over SSH with proper authentication"""
         full_command = [
             'ssh',
             '-p', str(self.ssh_port),
+            '-i', self.identity_file,
             '-o', 'BatchMode=yes',
             '-o', 'StrictHostKeyChecking=no',
             self.remote_host,
@@ -53,7 +62,6 @@ class NetworkedFS(Operations):
 
     def _verify_remote_setup(self):
         """Verify remote directory exists and is accessible"""
-        # First verify SSH connection
         test_cmd = f"test -d '{self.remote_path}' && echo 'Directory exists'"
         result = self._run_ssh_command(test_cmd)
         
@@ -61,7 +69,6 @@ class NetworkedFS(Operations):
             logger.error(f"Remote directory {self.remote_path} is not accessible")
             raise RuntimeError("Could not access remote directory")
         
-        # List the directory to verify permissions
         ls_cmd = f"ls -la '{self.remote_path}'"
         listing = self._run_ssh_command(ls_cmd)
         if listing:
