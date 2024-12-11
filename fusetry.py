@@ -60,6 +60,16 @@ class NetworkedFS(Operations):
             logger.error(f"SSH command error: {e}")
             return None
 
+    def _get_remote_file_size(self, remote_path):
+        """Get file size using ls -l instead of stat"""
+        cmd = f"ls -l '{remote_path}' | awk '{{print $5}}'"
+        size_str = self._run_ssh_command(cmd)
+        try:
+            return int(size_str) if size_str else 0
+        except (ValueError, TypeError):
+            logger.error(f"Could not get size for {remote_path}")
+            return 0
+
     def _verify_remote_setup(self):
         """Verify remote directory exists and is accessible"""
         test_cmd = f"test -d '{self.remote_path}' && echo 'Directory exists'"
@@ -76,19 +86,6 @@ class NetworkedFS(Operations):
             logger.info(listing)
         else:
             raise RuntimeError("Could not list remote directory")
-
-    def getxattr(self, path, name, position=0):
-        """Handle extended attributes"""
-        return bytes()  # Return empty bytes instead of empty string
-
-    def _check_remote_file_exists(self, path):
-        """Check if a file exists on the remote server"""
-        remote_path = self._get_remote_path(path)
-        cmd = f"test -f '{remote_path}' && echo 'exists'"
-        result = self._run_ssh_command(cmd)
-        exists = result == 'exists'
-        logger.debug(f"Remote file check: path='{remote_path}' exists={exists}")
-        return exists
 
     def getattr(self, path, fh=None):
         """Get file attributes"""
@@ -108,11 +105,8 @@ class NetworkedFS(Operations):
 
         if self._check_remote_file_exists(path):
             remote_path = self._get_remote_path(path)
-            # Get file size
-            size_cmd = f"stat -f %z '{remote_path}' || stat --format=%s '{remote_path}'"
-            size_str = self._run_ssh_command(size_cmd)
-            size = int(size_str) if size_str else 0
-
+            size = self._get_remote_file_size(remote_path)
+            
             return {
                 'st_mode': (stat.S_IFREG | 0o644),
                 'st_nlink': 1,
@@ -126,12 +120,43 @@ class NetworkedFS(Operations):
 
         raise FuseOSError(errno.ENOENT)
 
-    def _get_remote_path(self, path):
-        """Convert local path to remote path"""
-        clean_path = path.lstrip('/')
-        remote_path = os.path.join(self.remote_path, clean_path)
-        logger.debug(f"Path translation: local='{path}' → remote='{remote_path}'")
-        return remote_path
+    def _check_remote_file_exists(self, path):
+        """Check if a file exists on the remote server"""
+        remote_path = self._get_remote_path(path)
+        cmd = f"test -f '{remote_path}' && echo 'exists'"
+        result = self._run_ssh_command(cmd)
+        exists = result == 'exists'
+        logger.debug(f"Remote file check: path='{remote_path}' exists={exists}")
+        return exists
+
+    def read(self, path, size, offset, fh):
+        """Read data from file"""
+        logger.debug(f"read called for path: {path}")
+        remote_path = self._get_remote_path(path)
+        cache_path = os.path.join(self.cache_dir, path.lstrip('/'))
+        
+        # Ensure cache directory exists
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        
+        # Fetch file if not in cache
+        if not os.path.exists(cache_path):
+            scp_cmd = [
+                'scp',
+                '-P', str(self.ssh_port),
+                '-i', self.identity_file,
+                f'{self.remote_host}:{remote_path}',
+                cache_path
+            ]
+            logger.debug(f"Fetching file: {' '.join(scp_cmd)}")
+            try:
+                subprocess.run(scp_cmd, check=True)
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Failed to fetch file: {e}")
+                raise FuseOSError(errno.EIO)
+        
+        with open(cache_path, 'rb') as f:
+            f.seek(offset)
+            return f.read(size)
 
     def readdir(self, path, fh):
         """List directory contents"""
@@ -151,33 +176,12 @@ class NetworkedFS(Operations):
         logger.debug(f"Directory entries: {dirents}")
         return dirents
 
-    def read(self, path, size, offset, fh):
-        """Read data from file"""
-        logger.debug(f"read called for path: {path}")
-        remote_path = self._get_remote_path(path)
-        cache_path = os.path.join(self.cache_dir, path.lstrip('/'))
-        
-        # Ensure cache directory exists
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        
-        # Fetch file if not in cache
-        if not os.path.exists(cache_path):
-            scp_cmd = [
-                'scp',
-                '-P', str(self.ssh_port),
-                f'{self.remote_host}:{remote_path}',
-                cache_path
-            ]
-            logger.debug(f"Fetching file: {' '.join(scp_cmd)}")
-            try:
-                subprocess.run(scp_cmd, check=True)
-            except subprocess.CalledProcessError as e:
-                logger.error(f"Failed to fetch file: {e}")
-                raise FuseOSError(errno.EIO)
-        
-        with open(cache_path, 'rb') as f:
-            f.seek(offset)
-            return f.read(size)
+    def _get_remote_path(self, path):
+        """Convert local path to remote path"""
+        clean_path = path.lstrip('/')
+        remote_path = os.path.join(self.remote_path, clean_path)
+        logger.debug(f"Path translation: local='{path}' → remote='{remote_path}'")
+        return remote_path
 
 def main(remote_host, remote_path, mount_point, ssh_port=22):
     FUSE(NetworkedFS(remote_host, remote_path, ssh_port), mount_point, nothreads=True, foreground=True)
