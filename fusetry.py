@@ -1,3 +1,5 @@
+Basic Networked FUSE Filesystem
+
 #!/usr/bin/env python3
 
 import os
@@ -16,18 +18,26 @@ logger = logging.getLogger(__name__)
 
 class NetworkedFS(Operations):
     def __init__(self, remote_host, remote_path, ssh_port=22):
+        # Initialize basic filesystem settings
         self.remote_host = remote_host
         self.remote_path = os.path.abspath(remote_path)
         self.ssh_port = ssh_port
         self.cache_dir = '/tmp/netfs_cache'
         
-        # Get the original user's home directory and SSH key
+        # Track open files and their modifications
+        self.open_files = {}
+        self.modified_files = set()
+        
+        # Set up SSH authentication using the user's key
         sudo_user = os.environ.get('SUDO_USER', os.environ.get('USER'))
         user_info = pwd.getpwnam(sudo_user)
         self.user_home = user_info.pw_dir
         self.identity_file = os.path.join(self.user_home, '.ssh/id_rsa')
         
+        # Create cache directory
         Path(self.cache_dir).mkdir(exist_ok=True)
+        
+        # Log initialization details
         logger.info(f"Initialized NetworkedFS with:")
         logger.info(f"  Remote Host: {remote_host}")
         logger.info(f"  Remote Path: {self.remote_path}")
@@ -37,6 +47,115 @@ class NetworkedFS(Operations):
         
         self._verify_remote_setup()
 
+    # [Previous methods remain the same...]
+
+    def create(self, path, mode, fi=None):
+        """Create a new file"""
+        logger.debug(f"create called for path: {path}")
+        cache_path = os.path.join(self.cache_dir, path.lstrip('/'))
+        
+        # Create parent directories if they don't exist
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        
+        # Create the file locally
+        open(cache_path, 'a').close()
+        os.chmod(cache_path, mode)
+        
+        # Track this as a modified file
+        self.modified_files.add(path)
+        
+        return 0
+
+    def open(self, path, flags):
+        """Open a file and return a file handle"""
+        logger.debug(f"open called for path: {path}")
+        cache_path = os.path.join(self.cache_dir, path.lstrip('/'))
+        
+        # If file doesn't exist in cache, fetch it
+        if not os.path.exists(cache_path) and self._check_remote_file_exists(path):
+            self._fetch_file(path)
+        
+        # Generate a unique file handle
+        fh = len(self.open_files)
+        self.open_files[fh] = {'path': path, 'flags': flags}
+        
+        return fh
+
+    def write(self, path, data, offset, fh):
+        """Write data to a file"""
+        logger.debug(f"write called for path: {path}, offset: {offset}, length: {len(data)}")
+        cache_path = os.path.join(self.cache_dir, path.lstrip('/'))
+        
+        # Make sure the cache directory exists
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        
+        # Write the data to the cached file
+        with open(cache_path, 'rb+') as f:
+            f.seek(offset)
+            f.write(data)
+        
+        # Mark the file as modified
+        self.modified_files.add(path)
+        
+        return len(data)
+
+    def release(self, path, fh):
+        """Called when a file is closed"""
+        logger.debug(f"release called for path: {path}")
+        
+        # If the file was modified, sync it back to the remote server
+        if path in self.modified_files:
+            self._sync_to_remote(path)
+            self.modified_files.remove(path)
+        
+        # Clean up our file handle tracking
+        if fh in self.open_files:
+            del self.open_files[fh]
+        
+        return 0
+
+    def _sync_to_remote(self, path):
+        """Sync a modified file back to the remote server"""
+        logger.debug(f"Syncing {path} back to remote server")
+        cache_path = os.path.join(self.cache_dir, path.lstrip('/'))
+        remote_path = self._get_remote_path(path)
+        
+        if os.path.exists(cache_path):
+            try:
+                cmd = [
+                    'scp',
+                    '-P', str(self.ssh_port),
+                    '-i', self.identity_file,
+                    cache_path,
+                    f'{self.remote_host}:{remote_path}'
+                ]
+                logger.debug(f"Running sync command: {' '.join(cmd)}")
+                subprocess.run(cmd, check=True)
+                logger.info(f"Successfully synced {path} to remote server")
+                return True
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Failed to sync {path} to remote: {e}")
+                return False
+        return False
+
+    def truncate(self, path, length, fh=None):
+        """Truncate a file to a specified length"""
+        logger.debug(f"truncate called for path: {path}, length: {length}")
+        cache_path = os.path.join(self.cache_dir, path.lstrip('/'))
+        
+        # If file doesn't exist in cache but exists remotely, fetch it
+        if not os.path.exists(cache_path) and self._check_remote_file_exists(path):
+            self._fetch_file(path)
+        
+        # Truncate the cached file
+        with open(cache_path, 'r+b') as f:
+            f.truncate(length)
+        
+        # Mark the file as modified
+        self.modified_files.add(path)
+        
+        return 0
+    
     def _run_ssh_command(self, command):
         """Run a command over SSH with proper authentication"""
         full_command = [
