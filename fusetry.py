@@ -8,6 +8,7 @@ from fuse import FUSE, FuseOSError, Operations
 import subprocess
 from pathlib import Path
 import logging
+import time
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -15,7 +16,6 @@ logger = logging.getLogger(__name__)
 class NetworkedFS(Operations):
     def __init__(self, remote_host, remote_path, ssh_port=22):
         self.remote_host = remote_host
-        # Ensure remote_path is absolute and clean
         self.remote_path = os.path.abspath(remote_path)
         self.ssh_port = ssh_port
         self.cache_dir = '/tmp/netfs_cache'
@@ -26,132 +26,127 @@ class NetworkedFS(Operations):
         logger.info(f"  SSH Port: {ssh_port}")
         logger.info(f"  Cache Dir: {self.cache_dir}")
         
-        # Verify remote directory exists
+        # Verify remote connection and directory
         self._verify_remote_setup()
+
+    def _run_ssh_command(self, command):
+        """Run a command over SSH with proper quoting"""
+        full_command = [
+            'ssh',
+            '-p', str(self.ssh_port),
+            '-o', 'BatchMode=yes',
+            '-o', 'StrictHostKeyChecking=no',
+            self.remote_host,
+            command
+        ]
+        logger.debug(f"Running SSH command: {' '.join(full_command)}")
+        try:
+            result = subprocess.run(full_command, capture_output=True, text=True)
+            if result.returncode == 0:
+                return result.stdout.strip()
+            else:
+                logger.error(f"SSH command failed: {result.stderr}")
+                return None
+        except subprocess.CalledProcessError as e:
+            logger.error(f"SSH command error: {e}")
+            return None
 
     def _verify_remote_setup(self):
         """Verify remote directory exists and is accessible"""
-        cmd = [
-            'ssh',
-            '-p', str(self.ssh_port),
-            self.remote_host,
-            f'ls -ld "{self.remote_path}"'
-        ]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            logger.info(f"Remote directory check result: {result.stdout.strip()}")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to verify remote directory: {e}")
+        # First verify SSH connection
+        test_cmd = f"test -d '{self.remote_path}' && echo 'Directory exists'"
+        result = self._run_ssh_command(test_cmd)
+        
+        if result != 'Directory exists':
+            logger.error(f"Remote directory {self.remote_path} is not accessible")
             raise RuntimeError("Could not access remote directory")
+        
+        # List the directory to verify permissions
+        ls_cmd = f"ls -la '{self.remote_path}'"
+        listing = self._run_ssh_command(ls_cmd)
+        if listing:
+            logger.info("Remote directory contents:")
+            logger.info(listing)
+        else:
+            raise RuntimeError("Could not list remote directory")
 
-    def _get_remote_path(self, path):
-        """Convert local path to remote path"""
-        # Remove leading slash and join with remote path
-        clean_path = path.lstrip('/')
-        remote_path = os.path.join(self.remote_path, clean_path)
-        logger.debug(f"Path translation: local='{path}' → remote='{remote_path}'")
-        return remote_path
-
-    def _list_remote_dir(self, path):
-        """List contents of remote directory"""
-        remote_path = self._get_remote_path(path)
-        cmd = [
-            'ssh',
-            '-p', str(self.ssh_port),
-            self.remote_host,
-            f'ls -la "{remote_path}"'
-        ]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            logger.debug(f"Remote directory listing for {remote_path}:")
-            logger.debug(result.stdout)
-            return result.stdout.splitlines()
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to list remote directory: {e}")
-            return []
+    def getxattr(self, path, name, position=0):
+        """Handle extended attributes"""
+        return bytes()  # Return empty bytes instead of empty string
 
     def _check_remote_file_exists(self, path):
         """Check if a file exists on the remote server"""
         remote_path = self._get_remote_path(path)
-        cmd = [
-            'ssh',
-            '-p', str(self.ssh_port),
-            self.remote_host,
-            f'test -f "{remote_path}" && echo "exists" || echo "not found"'
-        ]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            exists = "exists" in result.stdout
-            logger.debug(f"Remote file check: path='{remote_path}' exists={exists}")
-            return exists
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Error checking remote file: {e}")
-            return False
+        cmd = f"test -f '{remote_path}' && echo 'exists'"
+        result = self._run_ssh_command(cmd)
+        exists = result == 'exists'
+        logger.debug(f"Remote file check: path='{remote_path}' exists={exists}")
+        return exists
 
     def getattr(self, path, fh=None):
         """Get file attributes"""
         logger.debug(f"getattr called for path: {path}")
         
-        # Special case for root directory
         if path == '/':
-            mode = stat.S_IFDIR | 0o755
             return {
-                'st_mode': mode,
+                'st_mode': (stat.S_IFDIR | 0o755),
                 'st_nlink': 2,
                 'st_size': 4096,
-                'st_ctime': os.path.getctime(self.cache_dir),
-                'st_mtime': os.path.getmtime(self.cache_dir),
-                'st_atime': os.path.getatime(self.cache_dir),
+                'st_ctime': time.time(),
+                'st_mtime': time.time(),
+                'st_atime': time.time(),
                 'st_uid': os.getuid(),
                 'st_gid': os.getgid()
             }
 
-        # Check if file exists remotely
         if self._check_remote_file_exists(path):
-            mode = stat.S_IFREG | 0o644
             remote_path = self._get_remote_path(path)
-            # Get file size from remote
-            try:
-                cmd = ['ssh', '-p', str(self.ssh_port), self.remote_host, f'stat -f %z "{remote_path}"']
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                size = int(result.stdout.strip())
-            except:
-                size = 0
-                
+            # Get file size
+            size_cmd = f"stat -f %z '{remote_path}' || stat --format=%s '{remote_path}'"
+            size_str = self._run_ssh_command(size_cmd)
+            size = int(size_str) if size_str else 0
+
             return {
-                'st_mode': mode,
+                'st_mode': (stat.S_IFREG | 0o644),
                 'st_nlink': 1,
                 'st_size': size,
-                'st_ctime': os.time(),
-                'st_mtime': os.time(),
-                'st_atime': os.time(),
+                'st_ctime': time.time(),
+                'st_mtime': time.time(),
+                'st_atime': time.time(),
                 'st_uid': os.getuid(),
                 'st_gid': os.getgid()
             }
 
         raise FuseOSError(errno.ENOENT)
 
+    def _get_remote_path(self, path):
+        """Convert local path to remote path"""
+        clean_path = path.lstrip('/')
+        remote_path = os.path.join(self.remote_path, clean_path)
+        logger.debug(f"Path translation: local='{path}' → remote='{remote_path}'")
+        return remote_path
+
     def readdir(self, path, fh):
         """List directory contents"""
         logger.debug(f"readdir called for path: {path}")
         dirents = ['.', '..']
         
-        # Get remote directory listing
-        remote_entries = self._list_remote_dir(path)
-        for line in remote_entries[1:]:  # Skip total line
-            if line.strip():
-                parts = line.split()
-                if len(parts) >= 9:
-                    name = ' '.join(parts[8:])
-                    if name not in ['.', '..']:
-                        dirents.append(name)
+        remote_path = self._get_remote_path(path)
+        ls_cmd = f"ls -1a '{remote_path}'"
+        result = self._run_ssh_command(ls_cmd)
+        
+        if result:
+            entries = result.split('\n')
+            for entry in entries:
+                if entry and entry not in ['.', '..']:
+                    dirents.append(entry)
         
         logger.debug(f"Directory entries: {dirents}")
         return dirents
 
     def read(self, path, size, offset, fh):
         """Read data from file"""
-        logger.debug(f"read called for path: {path}, size: {size}, offset: {offset}")
+        logger.debug(f"read called for path: {path}")
         remote_path = self._get_remote_path(path)
         cache_path = os.path.join(self.cache_dir, path.lstrip('/'))
         
@@ -160,23 +155,22 @@ class NetworkedFS(Operations):
         
         # Fetch file if not in cache
         if not os.path.exists(cache_path):
-            cmd = [
+            scp_cmd = [
                 'scp',
                 '-P', str(self.ssh_port),
                 f'{self.remote_host}:{remote_path}',
                 cache_path
             ]
-            logger.debug(f"Fetching file: {' '.join(cmd)}")
-            subprocess.run(cmd, check=True)
+            logger.debug(f"Fetching file: {' '.join(scp_cmd)}")
+            try:
+                subprocess.run(scp_cmd, check=True)
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Failed to fetch file: {e}")
+                raise FuseOSError(errno.EIO)
         
-        # Read from cache
         with open(cache_path, 'rb') as f:
             f.seek(offset)
             return f.read(size)
-
-    def getxattr(self, path, name, position=0):
-        """Handle extended attributes - return ENODATA for any request"""
-        return ''
 
 def main(remote_host, remote_path, mount_point, ssh_port=22):
     FUSE(NetworkedFS(remote_host, remote_path, ssh_port), mount_point, nothreads=True, foreground=True)
