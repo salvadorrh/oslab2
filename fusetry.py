@@ -68,6 +68,15 @@ class NetworkedFS(Operations):
         except subprocess.CalledProcessError as e:
             logger.error(f"Failed to fetch '{path}': {e}")
             return False
+        
+    def _check_remote_dir_exists(self, path):
+        """Check if a directory exists on the remote server"""
+        remote_path = self._get_remote_path(path)
+        cmd = f"test -d '{remote_path}' && echo 'exists'"
+        result = self._run_ssh_command(cmd)
+        exists = result == 'exists'
+        logger.debug(f"Remote directory check: path='{remote_path}' exists={exists}")
+        return exists
 
     def create(self, path, mode, fi=None):
         """Create a new file"""
@@ -230,6 +239,7 @@ class NetworkedFS(Operations):
         """Get file attributes"""
         logger.debug(f"getattr called for path: {path}")
         
+        # Handle root directory
         if path == '/':
             return {
                 'st_mode': (stat.S_IFDIR | 0o755),
@@ -242,6 +252,20 @@ class NetworkedFS(Operations):
                 'st_gid': os.getgid()
             }
 
+        # Check if it's a directory
+        if self._check_remote_dir_exists(path):
+            return {
+                'st_mode': (stat.S_IFDIR | 0o755),
+                'st_nlink': 2,
+                'st_size': 4096,
+                'st_ctime': time.time(),
+                'st_mtime': time.time(),
+                'st_atime': time.time(),
+                'st_uid': os.getuid(),
+                'st_gid': os.getgid()
+            }
+
+        # Check if it's a regular file
         if self._check_remote_file_exists(path):
             remote_path = self._get_remote_path(path)
             size = self._get_remote_file_size(remote_path)
@@ -303,16 +327,18 @@ class NetworkedFS(Operations):
         dirents = ['.', '..']
         
         remote_path = self._get_remote_path(path)
+        # Use -1a to get a simple listing including hidden files
         ls_cmd = f"ls -1a '{remote_path}'"
         result = self._run_ssh_command(ls_cmd)
         
         if result:
             entries = result.split('\n')
             for entry in entries:
+                entry = entry.strip()
                 if entry and entry not in ['.', '..']:
                     dirents.append(entry)
         
-        logger.debug(f"Directory entries: {dirents}")
+        logger.debug(f"Directory entries for {path}: {dirents}")
         return dirents
 
     def _get_remote_path(self, path):
